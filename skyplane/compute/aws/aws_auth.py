@@ -1,8 +1,10 @@
 from typing import Optional, Dict
 import json
+import boto3
+from botocore.config import Config
 
 from skyplane.config import SkyplaneConfig
-from skyplane.config_paths import config_path, aws_config_path, aws_quota_path
+from skyplane.config_paths import config_path, aws_config_path, aws_quota_path, cloud_config
 from skyplane.utils import imports, fn, logger
 
 
@@ -123,11 +125,22 @@ class AWSAuthentication:
     def get_boto3_resource(self, service_name, aws_region=None):
         return self.get_boto3_session().resource(service_name, region_name=aws_region)
 
-    def get_boto3_client(self, service_name, aws_region=None):
-        if aws_region is None:
-            return self.get_boto3_session().client(service_name)
+    def get_boto3_client(self, service: str, region: Optional[str] = None, **kwargs) -> boto3.client:
+        """Get a boto3 client with the appropriate credentials"""
+        region = region or cloud_config.get_flag("aws_default_region")
+        
+        # Use the existing AWS authentication mechanism
+        if self.config_mode == "manual":
+            session = boto3.Session(
+                aws_access_key_id=self.access_key,
+                aws_secret_access_key=self.secret_key,
+                region_name=region,
+            )
         else:
-            return self.get_boto3_session().client(service_name, region_name=aws_region)
+            session = boto3.Session(region_name=region)
+        
+        # Create client with provided kwargs
+        return session.client(service, **kwargs)
 
     def get_azs_in_region(self, region):
         ec2 = self.get_boto3_client("ec2", region)

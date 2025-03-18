@@ -50,6 +50,7 @@ class Provisioner:
         aws_auth: Optional[compute.AWSAuthentication] = None,
         azure_auth: Optional[compute.AzureAuthentication] = None,
         gcp_auth: Optional[compute.GCPAuthentication] = None,
+        nebius_auth: Optional[compute.NebiusAuthentication] = None,
         host_uuid: Optional[str] = None,
         ibmcloud_auth: Optional[compute.IBMCloudAuthentication] = None,
         scp_auth: Optional[compute.SCPAuthentication] = None,
@@ -61,6 +62,8 @@ class Provisioner:
         :type azure_auth: compute.AzureAuthentication
         :param gcp_auth: authentication information for gcp
         :type gcp_auth: compute.GCPAuthentication
+        :param nebius_auth: authentication information for nebius
+        :type nebius_auth: compute.NebiusAuthentication
         :param host_uuid: the uuid of the local host that requests the provision task
         :type host_uuid: string
         :param ibmcloud_auth: authentication information for aws
@@ -71,6 +74,7 @@ class Provisioner:
         self.aws_auth = aws_auth
         self.azure_auth = azure_auth
         self.gcp_auth = gcp_auth
+        self.nebius_auth = nebius_auth
         self.host_uuid = host_uuid
         self.ibmcloud_auth = ibmcloud_auth
         self.scp_auth = scp_auth
@@ -90,6 +94,7 @@ class Provisioner:
         self.gcp = compute.GCPCloudProvider(auth=self.gcp_auth)
         self.ibmcloud = compute.IBMCloudProvider(auth=self.ibmcloud_auth)
         self.scp = compute.SCPCloudProvider(auth=self.scp_auth)
+        self.nebius = compute.NebiusCloudProvider(auth=self.nebius_auth)
 
     def init_global(self, aws: bool = True, azure: bool = True, gcp: bool = True, ibmcloud: bool = True, scp: bool = True):
         """
@@ -186,6 +191,9 @@ class Provisioner:
                 assert self.scp.auth.enabled(), "SCP credentials not configured"
                 # print('def _provision_task : ', task.region, task.vm_type, task.tags)
                 server = self.scp.provision_instance(task.region, task.vm_type, tags=task.tags)
+            elif task.cloud_provider == "nebius":
+                assert self.nebius.auth.enabled(), "Nebius credentials not configured"
+                server = self.nebius.provision_instance(task.region, task.vm_type, tags=task.tags)
             else:
                 raise NotImplementedError(f"Unknown provider {task.cloud_provider}")
         logger.fs.debug(f"[Provisioner._provision_task] Provisioned {server} in {t.elapsed:.2f}s")
@@ -220,6 +228,7 @@ class Provisioner:
         ibmcloud_provisioned = any([task.cloud_provider == "ibmcloud" for task in provision_tasks])
         scp_regions = set([task.region for task in provision_tasks if task.cloud_provider == "scp"])
         scp_provisioned = any([task.cloud_provider == "scp" for task in provision_tasks])
+        nebius_provisioned = any([task.cloud_provider == "nebius" for task in provision_tasks])
 
         # configure regions
         if aws_provisioned:
@@ -349,6 +358,7 @@ class Provisioner:
         gcp_deprovisioned = any([s.provider == "gcp" for s in servers])
         ibmcloud_deprovisioned = any([s.provider == "ibmcloud" for s in servers])
         scp_deprovisioned = any([s.provider == "scp" for s in servers])
+        nebius_deprovisioned = any([s.provider == "nebius" for s in servers])
         if azure_deprovisioned:
             logger.warning("Azure deprovisioning is very slow. Please be patient.")
         logger.fs.info(f"[Provisioner.deprovision] Deprovisioning {len(servers)} VMs")
@@ -381,6 +391,9 @@ class Provisioner:
                     vpcids = [s.vpc_id for s in scp_servers]
                     jobs.extend([partial(self.scp.remove_gateway_rule_region, r, scp_ips, vpcids)])
                 logger.fs.info(f"[Provisioner.deprovision] Deauthorizing SCP gateways with firewalls: {scp_ips}")
+            if nebius_deprovisioned:
+                jobs.extend([partial(self.nebius.remove_gateway_rule, rule) for rule in self.nebius_firewall_rules])
+                logger.fs.info(f"[Provisioner.deprovision] Deauthorizing Nebius gateways with firewalls: {self.nebius_firewall_rules}")
             do_parallel(
                 lambda fn: fn(), jobs, n=max_jobs, spinner=spinner, spinner_persist=False, desc="Deauthorizing gateways from firewalls"
             )

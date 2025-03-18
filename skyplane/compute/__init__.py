@@ -16,6 +16,20 @@ from skyplane.compute.scp.scp_auth import SCPAuthentication
 from skyplane.compute.scp.scp_cloud_provider import SCPCloudProvider
 from skyplane.compute.scp.scp_server import SCPServer
 
+# Add Nebius imports
+try:
+    print("Attempting to import Nebius modules...")  # Debug line
+    from skyplane.compute.nebius.nebius_auth import NebiusAuthentication
+    from skyplane.compute.nebius.nebius_cloud_provider import NebiusCloudProvider
+    from skyplane.compute.nebius.nebius_server import NebiusServer
+    print("Successfully imported Nebius modules")  # Debug line
+    HAVE_NEBIUS = True
+except ImportError as e:
+    print(f"Failed to import Nebius modules: {e}")  # Debug line
+    HAVE_NEBIUS = False
+    NebiusCloudProvider = None
+    NebiusServer = None
+
 __all__ = [
     "CloudProvider",
     "Server",
@@ -36,3 +50,6 @@ __all__ = [
     "SCPCloudProvider",
     "SCPServer",
 ]
+
+if HAVE_NEBIUS:
+    __all__ += ["NebiusAuthentication", "NebiusCloudProvider", "NebiusServer"]

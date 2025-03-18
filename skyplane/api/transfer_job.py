@@ -25,7 +25,7 @@ from functools import partial
 from skyplane import exceptions
 from skyplane.api.config import TransferConfig
 from skyplane.chunk import Chunk
-from skyplane.obj_store.storage_interface import StorageInterface
+from skyplane.obj_store.storage_interface import ObjectStoreInterface as StorageInterface
 from skyplane.obj_store.object_store_interface import ObjectStoreObject, ObjectStoreInterface
 from skyplane.utils import logger
 from skyplane.utils.definitions import MB

@@ -2,7 +2,9 @@ import base64
 import hashlib
 import os
 from functools import lru_cache
+from pathlib import Path
 from datetime import datetime, UTC
+import configparser
 
 from typing import Any, Iterator, List, Optional, Tuple
 
@@ -12,95 +14,107 @@ from skyplane.obj_store.object_store_interface import ObjectStoreInterface, Obje
 from skyplane.config_paths import cloud_config
 from skyplane.utils import logger, imports
 from skyplane.utils.generator import batch_generator
+from skyplane.obj_store.s3_interface import S3Interface, S3Object
+from botocore.config import Config
+from skyplane.compute.nebius.nebius_auth import NebiusAuthentication
+from skyplane.compute.nebius.nebius_s3_auth import NebiusS3Authentication
+import boto3
 
 
-class S3Object(ObjectStoreObject):
-    def __init__(self, key: str, provider: str, bucket: str, size: int, last_modified: datetime, mime_type: Optional[str] = None):
-        # Ensure last_modified is timezone-aware
-        if last_modified.tzinfo is None:
-            last_modified = datetime.fromtimestamp(last_modified.timestamp(), UTC)
-        super().__init__(key, provider, bucket, size, last_modified, mime_type)
+class NBS3Interface(S3Interface):
+    # Available Nebius regions with their endpoints
+    NEBIUS_REGIONS = {
+        "eu-north1": "https://storage.eu-north1.nebius.cloud",  # Finland
+        # "eu-west1": "https://storage.eu-west1.nebius.cloud",  # France - Not supported yet
+    }
 
-    def full_path(self):
-        return f"s3://{self.bucket}/{self.key}"
-
-
-class S3Interface(ObjectStoreInterface):
     def __init__(self, bucket_name: str):
-        self.auth = compute.AWSAuthentication()
-        self.requester_pays = False
-        self.bucket_name = bucket_name
+        super().__init__(bucket_name)
+        
+        # Try to read credentials from ~/.skyplane/config first
+        config_path = os.path.expanduser("~/.skyplane/config")
+        logger.info(f"Looking for Nebius S3 credentials in {config_path}")
+        
+        try:
+            # Use the new S3 authentication class
+            self.auth = NebiusS3Authentication.from_config_file(config_path)
+            logger.info(f"Successfully initialized Nebius S3 authentication for bucket: {bucket_name}")
+        except Exception as e:
+            logger.error(f"Failed to initialize Nebius S3 authentication: {e}")
+            raise
+        
         self._cached_s3_clients = {}
+        logger.info(f"NBS3Interface initialized for bucket: {bucket_name}")
 
     @property
     def provider(self):
-        return "aws"
+        return "nebius"
 
     def path(self):
-        return f"s3://{self.bucket_name}"
+        return f"nebius://{self.bucket_name}"
 
     @property
-    @lru_cache(maxsize=1)
     def aws_region(self):
-        s3_client = self.auth.get_boto3_client("s3")
-        default_region = cloud_config.get_flag("aws_default_region")
-        try:
-            # None means us-east-1 for legacy reasons
-            region = s3_client.get_bucket_location(Bucket=self.bucket_name).get("LocationConstraint", "us-east-1")
-            return region if region is not None else default_region
-        except Exception as e:
-            if "An error occurred (AccessDenied) when calling the GetBucketLocation operation" in str(e):
-                logger.warning(f"Bucket location {self.bucket_name} is not public. Assuming region is {default_region}")
-                return default_region
-            elif "An error occurred (InvalidAccessKeyId) when calling" in str(e):
-                logger.warning(f"Invalid AWS credentials. Check to make sure credentials configured properly.")
-                raise exceptions.PermissionsException(f"Invalid AWS credentials for accessing bucket {self.bucket_name}")
-            else:
-                logger.warning(f"Specified bucket {self.bucket_name} does not exist, got AWS error: {e}")
-                raise exceptions.MissingBucketException(f"S3 bucket {self.bucket_name} does not exist") from e
+        if not self._region:
+            # Default to eu-north1 if region not specified
+            self._region = "eu-north1"
+        return self._region
 
     def region_tag(self):
-        return "aws:" + self.aws_region
-
-    def bucket(self) -> str:
-        return self.bucket_name
-
-    def set_requester_bool(self, requester: bool):
-        self.requester_pays = requester
+        return "nebius:" + self.aws_region
 
     def _s3_client(self, region=None):
         region = region if region is not None else self.aws_region
+        if region not in self.NEBIUS_REGIONS:
+            raise ValueError(f"Invalid Nebius region: {region}. Available regions: {list(self.NEBIUS_REGIONS.keys())}")
+            
         if region not in self._cached_s3_clients:
-            self._cached_s3_clients[region] = self.auth.get_boto3_client("s3", region)
+            # Create proper Config object for S3
+            s3_config = boto3.session.Config(
+                signature_version='s3v4',
+                s3={'addressing_style': 'path'}
+            )
+            
+            self._cached_s3_clients[region] = self.auth.get_boto3_client(
+                "s3",
+                region,
+                endpoint_url=self.NEBIUS_REGIONS[region],
+                config=s3_config  # Pass config object instead of individual settings
+            )
         return self._cached_s3_clients[region]
 
-    @imports.inject("botocore.exceptions", pip_extra="aws")
-    def bucket_exists(botocore_exceptions, self, region=None):
-        if region is None:  # use current bucket region is available
-            try:
-                region = self.aws_region
-            except exceptions.MissingBucketException:
-                region = "us-east-1"
-
+    def create_bucket(self, region_tag: str):
+        # Extract region from region_tag (e.g., "nebius:eu-north1" -> "eu-north1")
+        region = region_tag.split(":")[-1] if ":" in region_tag else region_tag
+        if region not in self.NEBIUS_REGIONS:
+            raise ValueError(f"Invalid Nebius region: {region}. Available regions: {list(self.NEBIUS_REGIONS.keys())}")
+        
+        self._region = region  # Set the region
+        logger.info(f"Creating bucket {self.bucket_name} in region {region}")
+        
         s3_client = self._s3_client(region)
-        try:
-            requester_pays = {"RequestPayer": "requester"} if self.requester_pays else {}
-            s3_client.list_objects_v2(Bucket=self.bucket_name, MaxKeys=1, **requester_pays)
-            return True
-        except botocore_exceptions.ClientError as e:
-            if e.response["Error"]["Code"] == "NoSuchBucket" or e.response["Error"]["Code"] == "AccessDenied":
-                return False
-            raise
-
-    def create_bucket(self, aws_region):
-        s3_client = self._s3_client(aws_region)
-        if not self.bucket_exists(aws_region):
-            if aws_region == "us-east-1":
-                s3_client.create_bucket(Bucket=self.bucket_name)
-            else:
-                s3_client.create_bucket(Bucket=self.bucket_name, CreateBucketConfiguration={"LocationConstraint": aws_region})
+        
+        if not self.bucket_exists():
+            # Don't specify LocationConstraint for Nebius S3
+            try:
+                logger.info(f"Bucket {self.bucket_name} doesn't exist, creating it now...")
+                response = s3_client.create_bucket(Bucket=self.bucket_name)
+                logger.info(f"Bucket created successfully: {response}")
+                
+                # Verify bucket exists
+                all_buckets = s3_client.list_buckets()
+                bucket_names = [b['Name'] for b in all_buckets.get('Buckets', [])]
+                logger.info(f"All buckets: {bucket_names}")
+                
+                if self.bucket_name in bucket_names:
+                    logger.info(f"Confirmed bucket {self.bucket_name} exists in bucket list")
+                else:
+                    logger.warning(f"Bucket {self.bucket_name} not found in bucket list after creation!")
+            except Exception as e:
+                logger.error(f"Failed to create bucket {self.bucket_name}: {e}")
+                raise
         else:
-            logger.warning(f"Bucket {self.bucket} in region {aws_region} already exists")
+            logger.info(f"Bucket {self.bucket_name} in region {region} already exists")
 
     def delete_bucket(self):
         # delete 1000 keys at a time
@@ -153,11 +167,7 @@ class S3Interface(ObjectStoreInterface):
         return self.get_obj_metadata(obj_name)["ContentLength"]
 
     def get_obj_last_modified(self, obj_name):
-        last_modified = self.get_obj_metadata(obj_name)["LastModified"]
-        # Convert to timezone-aware datetime if it's naive
-        if last_modified.tzinfo is None:
-            last_modified = datetime.fromtimestamp(last_modified.timestamp(), UTC)
-        return last_modified
+        return self.get_obj_metadata(obj_name)["LastModified"]
 
     def get_obj_mime_type(self, obj_name):
         return self.get_obj_metadata(obj_name)["ContentType"]
@@ -219,20 +229,39 @@ class S3Interface(ObjectStoreInterface):
         b64_md5sum = base64.b64encode(check_md5).decode("utf-8") if check_md5 else None
         checksum_args = dict(ContentMD5=b64_md5sum) if b64_md5sum else dict()
 
+        logger.info(f"Uploading {src_file_path} to {self.bucket_name}/{dst_object_name}")
+        
         try:
             with open(src_file_path, "rb") as f:
                 if upload_id:
-                    s3_client.upload_part(
+                    logger.info(f"Uploading part {part_number} of multipart upload {upload_id}")
+                    response = s3_client.upload_part(
                         Body=f,
                         Key=dst_object_name,
                         Bucket=self.bucket_name,
                         PartNumber=part_number,
-                        UploadId=upload_id.strip(),  # TODO: figure out why whitespace gets added,
+                        UploadId=upload_id.strip(),
                         **checksum_args,
                     )
+                    logger.info(f"Part uploaded successfully: {response}")
                 else:
                     mime_args = dict(ContentType=mime_type) if mime_type else dict()
-                    s3_client.put_object(Body=f, Key=dst_object_name, Bucket=self.bucket_name, **checksum_args, **mime_args)
+                    logger.info(f"Uploading object with mime type: {mime_type}")
+                    response = s3_client.put_object(
+                        Body=f, 
+                        Key=dst_object_name, 
+                        Bucket=self.bucket_name, 
+                        **checksum_args, 
+                        **mime_args
+                    )
+                    logger.info(f"Object uploaded successfully: {response}")
+                    
+                    # Verify object exists
+                    try:
+                        head = s3_client.head_object(Bucket=self.bucket_name, Key=dst_object_name)
+                        logger.info(f"Confirmed object exists: size={head.get('ContentLength')} bytes")
+                    except Exception as e:
+                        logger.warning(f"Could not verify object exists after upload: {e}")
         except botocore_exceptions.ClientError as e:
             # catch MD5 mismatch error and raise appropriate exception
             if "Error" in e.response and "Code" in e.response["Error"] and e.response["Error"]["Code"] == "InvalidDigest":
@@ -271,3 +300,47 @@ class S3Interface(ObjectStoreInterface):
             MultipartUpload={"Parts": [{"PartNumber": p["PartNumber"], "ETag": p["ETag"]} for p in all_parts]},
         )
         assert "ETag" in response, f"Failed to complete multipart upload for {dst_object_name}: {response}"
+
+    def get_object(self, key: str) -> bytes:
+        """Get object from bucket"""
+        try:
+            response = self._s3_client().get_object(Bucket=self.bucket_name, Key=key)
+            return response['Body'].read()
+        except Exception as e:
+            raise NoSuchObjectException(f"Failed to get object {key}: {str(e)}")
+
+    def get_obj_size(self, key: str) -> int:
+        """Get object size"""
+        try:
+            response = self._s3_client().head_object(Bucket=self.bucket_name, Key=key)
+            return response['ContentLength']
+        except Exception as e:
+            raise NoSuchObjectException(f"Failed to get object size for {key}: {str(e)}")
+
+    def exists(self, key: str) -> bool:
+        """Check if object exists"""
+        try:
+            self._s3_client().head_object(Bucket=self.bucket_name, Key=key)
+            return True
+        except:
+            return False
+
+    def upload_object(self, local_path: str, remote_path: str):
+        """Upload object to bucket"""
+        try:
+            self._s3_client().upload_file(local_path, self.bucket_name, remote_path)
+        except Exception as e:
+            raise Exception(f"Failed to upload {local_path} to {remote_path}: {str(e)}")
+
+    def bucket_exists(self) -> bool:
+        """Check if the bucket exists"""
+        try:
+            s3_client = self._s3_client()
+            all_buckets = s3_client.list_buckets()
+            bucket_names = [b['Name'] for b in all_buckets.get('Buckets', [])]
+            exists = self.bucket_name in bucket_names
+            logger.info(f"Bucket {self.bucket_name} exists: {exists}")
+            return exists
+        except Exception as e:
+            logger.error(f"Error checking if bucket {self.bucket_name} exists: {e}")
+            return False
